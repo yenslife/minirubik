@@ -381,6 +381,51 @@ typedef struct {
 
 #define BM_MAX_DEPTH 11
 #define BM_NO_FACE 3
+#define BM_ORI_BITS 10
+#define BM_ORI_MASK 0x3ffU
+#define BM_FOUND (-1)
+
+/*
+ * Avoid move / 3 in the target-shaped hot loop.
+ *
+ * 0,1,2 -> R
+ * 3,4,5 -> B
+ * 6,7,8 -> D
+ */
+static const uint8_t bm_move_face[MOVES] = {
+    0, 0, 0,
+    1, 1, 1,
+    2, 2, 2,
+};
+
+/*
+ * Forward declarations used by the packed benchmark.
+ */
+static void bm_rank_to_string(uint32_t rank,
+                              char output[15]);
+
+static bm_stats_t bm_solve_iterative_transition_design(
+    uint16_t p,
+    uint16_t o,
+    bm_transition_design_t design);
+
+typedef uint32_t bm_packed_state_t;
+
+static inline bm_packed_state_t bm_pack_state(uint16_t p, uint16_t o)
+{
+    return ((uint32_t) p << BM_ORI_BITS) | o;
+}
+
+static inline uint16_t bm_state_perm(bm_packed_state_t state)
+{
+    return (uint16_t) (state >> BM_ORI_BITS);
+}
+
+static inline uint16_t bm_state_ori(bm_packed_state_t state)
+{
+    return (uint16_t) (state & BM_ORI_MASK);
+}
+
 
 typedef struct {
     uint16_t p;
@@ -404,9 +449,383 @@ typedef struct {
     int min_excess;
 } bm_frame_t;
 
+typedef struct {
+    bm_packed_state_t state;
 
-#define BM_FOUND (-1)
-static void bm_rank_to_string(uint32_t rank, char output[15]);
+    uint8_t prev_face;
+    uint8_t next_move;
+    uint8_t min_excess;
+    uint8_t padding;
+} bm_packed_frame_t;
+
+static uint8_t bm_packed_heuristic(
+    bm_packed_state_t state,
+    bm_stats_t *stats)
+{
+    uint16_t p =
+        bm_state_perm(state);
+
+    uint16_t o =
+        bm_state_ori(state);
+
+    uint8_t hp =
+        bm_perm_pdb[p];
+
+    uint8_t ho =
+        bm_ori_pdb[o];
+
+    stats->pdb_table_loads += 2;
+
+    return hp > ho ? hp : ho;
+}
+
+static bm_packed_state_t bm_packed_transition(
+    bm_packed_state_t state,
+    uint8_t move,
+    bm_stats_t *stats)
+{
+    uint16_t p =
+        bm_state_perm(state);
+
+    uint16_t o =
+        bm_state_ori(state);
+
+    uint16_t next_p =
+        bm_perm_move[move][p];
+
+    uint16_t next_o =
+        bm_ori_move[move][o];
+
+    ++stats->transition_applications;
+    stats->transition_table_loads += 2;
+
+    return bm_pack_state(next_p, next_o);
+}
+
+static int bm_dfs_packed(
+    bm_packed_state_t root,
+    int bound,
+    bm_stats_t *stats)
+{
+    bm_packed_frame_t stack[BM_MAX_DEPTH + 1];
+
+    int depth = 0;
+
+    int h =
+        bm_packed_heuristic(
+            root,
+            stats);
+
+    if (h > bound)
+        return h;
+
+    if (root == 0) {
+        stats->solution_depth = 0;
+        return BM_FOUND;
+    }
+
+    ++stats->expanded_total;
+    ++stats->expanded_iter;
+
+    stack[0] = (bm_packed_frame_t) {
+        .state = root,
+        .prev_face = BM_NO_FACE,
+        .next_move = 0,
+        .min_excess = UINT8_MAX,
+        .padding = 0,
+    };
+
+    for (;;) {
+        bm_packed_frame_t *frame =
+            &stack[depth];
+
+        int descended = 0;
+
+        while (frame->next_move < MOVES) {
+            uint8_t move =
+                frame->next_move++;
+
+            /*
+             * No division by 3.
+             */
+            uint8_t face =
+                bm_move_face[move];
+
+            if (face == frame->prev_face)
+                continue;
+
+            ++stats->generated_total;
+            ++stats->generated_iter;
+
+            bm_packed_state_t next =
+                bm_packed_transition(
+                    frame->state,
+                    move,
+                    stats);
+
+            int child_depth =
+                depth + 1;
+
+            stats->path[depth] =
+                move;
+
+            int child_h =
+                bm_packed_heuristic(
+                    next,
+                    stats);
+
+            int child_f =
+                child_depth + child_h;
+
+            if (child_f > bound) {
+                if (child_f <
+                    frame->min_excess) {
+                    frame->min_excess =
+                        (uint8_t) child_f;
+                }
+
+                continue;
+            }
+
+            /*
+             * p == 0 && o == 0 is simply packed state == 0.
+             */
+            if (next == 0) {
+                stats->solution_depth =
+                    child_depth;
+
+                return BM_FOUND;
+            }
+
+            if (child_depth >
+                BM_MAX_DEPTH) {
+                fputs(
+                    "packed IDA* stack overflow\n",
+                    stderr);
+
+                exit(1);
+            }
+
+            ++stats->expanded_total;
+            ++stats->expanded_iter;
+
+            ++depth;
+
+            stack[depth] =
+                (bm_packed_frame_t) {
+                    .state = next,
+                    .prev_face = face,
+                    .next_move = 0,
+                    .min_excess = UINT8_MAX,
+                    .padding = 0,
+                };
+
+            descended = 1;
+            break;
+        }
+
+        if (descended)
+            continue;
+
+        int result =
+            frame->min_excess;
+
+        if (depth == 0)
+            return result;
+
+        --depth;
+
+        if (result <
+            stack[depth].min_excess) {
+            stack[depth].min_excess =
+                (uint8_t) result;
+        }
+    }
+}
+
+static bm_stats_t bm_solve_packed(
+    uint16_t p,
+    uint16_t o)
+{
+    bm_stats_t stats = {0};
+
+    stats.solution_depth = -1;
+
+    bm_packed_state_t root =
+        bm_pack_state(p, o);
+
+    /*
+     * Initial IDA* threshold.
+     */
+    uint8_t hp =
+        bm_perm_pdb[p];
+
+    uint8_t ho =
+        bm_ori_pdb[o];
+
+    stats.pdb_table_loads += 2;
+
+    int bound =
+        hp > ho ? hp : ho;
+
+    for (;;) {
+        stats.expanded_iter = 0;
+        stats.generated_iter = 0;
+
+        int next =
+            bm_dfs_packed(
+                root,
+                bound,
+                &stats);
+
+        if (next == BM_FOUND)
+            return stats;
+
+        if (next == UINT8_MAX) {
+            fputs(
+                "packed IDA* search failed\n",
+                stderr);
+
+            exit(1);
+        }
+
+        bound = next;
+    }
+}
+
+static void bm_compare_packed_design(
+    const uint8_t *full_dist,
+    uint32_t d11_count)
+{
+    uint32_t count = 0;
+
+    clock_t split_ticks = 0;
+    clock_t packed_ticks = 0;
+
+    for (uint32_t rank = 0;
+         rank < STATES;
+         ++rank) {
+
+        if (full_dist[rank] != 11)
+            continue;
+
+        uint16_t p =
+            (uint16_t)
+            (rank / ORIENTATIONS);
+
+        uint16_t o =
+            (uint16_t)
+            (rank % ORIENTATIONS);
+
+        clock_t begin =
+            clock();
+
+        bm_stats_t split =
+            bm_solve_iterative_transition_design(
+                p,
+                o,
+                BM_TRANS_9);
+
+        clock_t middle =
+            clock();
+
+        bm_stats_t packed =
+            bm_solve_packed(
+                p,
+                o);
+
+        clock_t end =
+            clock();
+
+        split_ticks +=
+            middle - begin;
+
+        packed_ticks +=
+            end - middle;
+
+        if (split.solution_depth !=
+                packed.solution_depth ||
+            split.expanded_total !=
+                packed.expanded_total ||
+            split.generated_total !=
+                packed.generated_total ||
+            split.transition_applications !=
+                packed.transition_applications ||
+            split.transition_table_loads !=
+                packed.transition_table_loads ||
+            split.pdb_table_loads !=
+                packed.pdb_table_loads) {
+
+            char state_string[15];
+
+            bm_rank_to_string(
+                rank,
+                state_string);
+
+            fprintf(
+                stderr,
+                "packed-state mismatch on %s\n",
+                state_string);
+
+            exit(1);
+        }
+
+        ++count;
+
+        if (count % 100 == 0) {
+            fprintf(
+                stderr,
+                "\rtested %u / %u",
+                count,
+                d11_count);
+
+            fflush(stderr);
+        }
+    }
+
+    fprintf(stderr, "\n");
+
+    if (count != d11_count) {
+        fprintf(
+            stderr,
+            "distance-11 count mismatch:"
+            " %u != %u\n",
+            count,
+            d11_count);
+
+        exit(1);
+    }
+
+    printf(
+        "\n"
+        "===== split vs packed state =====\n");
+
+    printf(
+        "distance-11 states = %u\n",
+        count);
+
+    printf(
+        "split-state CPU time = %.3f s\n",
+        (double) split_ticks /
+            CLOCKS_PER_SEC);
+
+    printf(
+        "packed-state CPU time = %.3f s\n",
+        (double) packed_ticks /
+            CLOCKS_PER_SEC);
+
+    printf(
+        "packed frame size = %zu bytes\n",
+        sizeof(bm_packed_frame_t));
+
+    printf(
+        "explicit stack size = %zu bytes\n",
+        sizeof(bm_packed_frame_t)
+            * (BM_MAX_DEPTH + 1));
+
+    printf(
+        "all search counters match = yes\n");
+}
 
 static void bm_apply_transition(
     bm_transition_design_t design,
@@ -1505,7 +1924,36 @@ int main(int argc, char **argv)
 
     printf("permutation PDB max distance = %u\n",
            permutation_diameter);
+
+    if (argc == 2
+        && !strcmp(
+            argv[1],
+            "--compare-packed")) {
     
+        uint8_t full_diameter;
+        uint32_t d11_count;
+    
+        uint8_t *full_dist =
+            bm_build_full_distance(
+                &full_diameter,
+                &d11_count);
+    
+        printf(
+            "full-state diameter = %u\n",
+            full_diameter);
+    
+        printf(
+            "distance-11 states = %u\n",
+            d11_count);
+    
+        bm_compare_packed_design(
+            full_dist,
+            d11_count);
+    
+        free(full_dist);
+    
+        return 0;
+    } 
     if (argc == 2
         && !strcmp(argv[1], "--compare-stack")) {
     
