@@ -2079,6 +2079,39 @@ static void bm_rank_to_string(uint32_t rank,
     output[14] = '\0';
 }
 
+static void bm_emit_d11_packed(const uint8_t *full_dist)
+{
+    for (uint32_t rank = 0; rank < STATES; ++rank) {
+        if (full_dist[rank] != 11)
+            continue;
+
+        uint16_t p =
+            (uint16_t) (rank / ORIENTATIONS);
+
+        uint16_t o =
+            (uint16_t) (rank % ORIENTATIONS);
+
+        uint32_t packed =
+            ((uint32_t) p << BM_ORI_BITS) | o;
+
+        char state_string[15];
+
+        bm_rank_to_string(
+            rank,
+            state_string);
+
+        /*
+         * packed state rank p o
+         */
+        printf("%u\t%s\t%u\t%u\t%u\n",
+               packed,
+               state_string,
+               rank,
+               p,
+               o);
+    }
+}
+
 typedef struct {
     uint32_t rank;
 
@@ -2104,6 +2137,33 @@ int main(int argc, char **argv)
             bm_perm_pdb,
             PERMUTATIONS,
             &bm_perm_move[0][0]);
+
+    if (argc == 2 &&
+        !strcmp(argv[1],
+                "--emit-d11-packed")) {
+    
+        uint8_t full_diameter;
+        uint32_t d11_count;
+    
+        uint8_t *full_dist =
+            bm_build_full_distance(
+                &full_diameter,
+                &d11_count);
+    
+        if (full_diameter != 11 ||
+            d11_count != 2644) {
+            fprintf(stderr,
+                    "unexpected full-state distribution\n");
+    
+            free(full_dist);
+            return 1;
+        }
+    
+        bm_emit_d11_packed(full_dist);
+    
+        free(full_dist);
+        return 0;
+    }
 
     /*
      * Generate static tables for the RV32I target.
