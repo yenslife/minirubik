@@ -379,6 +379,31 @@ typedef struct {
     uint8_t path[12];
 } bm_stats_t;
 
+#define BM_MAX_DEPTH 11
+#define BM_NO_FACE 3
+
+typedef struct {
+    uint16_t p;
+    uint16_t o;
+
+    /*
+     * Face used to reach this node.
+     * 0 = R, 1 = B, 2 = D, 3 = root.
+     */
+    uint8_t prev_face;
+
+    /*
+     * Next move to try when we return to this frame.
+     */
+    uint8_t next_move;
+
+    /*
+     * Minimum f-value that exceeded the current threshold
+     * in this subtree.
+     */
+    int min_excess;
+} bm_frame_t;
+
 
 #define BM_FOUND (-1)
 static void bm_rank_to_string(uint32_t rank, char output[15]);
@@ -637,6 +662,410 @@ static bm_stats_t bm_solve_transition_design(
 
         bound = next;
     }
+}
+
+static int bm_dfs_iterative_transition_design(
+    uint16_t root_p,
+    uint16_t root_o,
+    int bound,
+    bm_transition_design_t design,
+    bm_stats_t *stats)
+{
+    bm_frame_t stack[BM_MAX_DEPTH + 1];
+
+    int depth = 0;
+
+    /*
+     * Evaluate the root exactly as recursive bm_dfs() does.
+     */
+    int h =
+        bm_combined_heuristic_counted(
+            root_p,
+            root_o,
+            stats);
+
+    int f = h;
+
+    if (f > bound)
+        return f;
+
+    if (root_p == 0 && root_o == 0) {
+        stats->solution_depth = 0;
+        return BM_FOUND;
+    }
+
+    ++stats->expanded_total;
+    ++stats->expanded_iter;
+
+    stack[0] = (bm_frame_t) {
+        .p = root_p,
+        .o = root_o,
+        .prev_face = BM_NO_FACE,
+        .next_move = 0,
+        .min_excess = INT_MAX,
+    };
+
+    for (;;) {
+        bm_frame_t *frame =
+            &stack[depth];
+
+        int descended = 0;
+
+        /*
+         * Resume this frame from the next move that has
+         * not yet been examined.
+         */
+        while (frame->next_move < MOVES) {
+            uint8_t move =
+                frame->next_move++;
+
+            uint8_t face =
+                (uint8_t) (move / 3U);
+
+            /*
+             * Same-face pruning.
+             */
+            if (face == frame->prev_face)
+                continue;
+
+            ++stats->generated_total;
+            ++stats->generated_iter;
+
+            uint16_t next_p;
+            uint16_t next_o;
+
+            bm_apply_transition(
+                design,
+                move,
+                frame->p,
+                frame->o,
+                &next_p,
+                &next_o,
+                stats);
+
+            int child_depth =
+                depth + 1;
+
+            /*
+             * Store the move producing this child.
+             */
+            stats->path[depth] = move;
+
+            /*
+             * Evaluate the child before pushing it.
+             *
+             * This is equivalent to entering the recursive
+             * bm_dfs() call and immediately evaluating f.
+             */
+            int child_h =
+                bm_combined_heuristic_counted(
+                    next_p,
+                    next_o,
+                    stats);
+
+            int child_f =
+                child_depth + child_h;
+
+            if (child_f > bound) {
+                if (child_f < frame->min_excess)
+                    frame->min_excess = child_f;
+
+                continue;
+            }
+
+            if (next_p == 0 && next_o == 0) {
+                stats->solution_depth =
+                    child_depth;
+
+                return BM_FOUND;
+            }
+
+            /*
+             * A non-solved state at depth 11 must have h >= 1,
+             * and therefore cannot pass a bound <= 11.
+             *
+             * Keep this check anyway to guard the fixed stack.
+             */
+            if (child_depth > BM_MAX_DEPTH) {
+                fputs("explicit IDA* stack overflow\n",
+                      stderr);
+                exit(1);
+            }
+
+            ++stats->expanded_total;
+            ++stats->expanded_iter;
+
+            ++depth;
+
+            stack[depth] = (bm_frame_t) {
+                .p = next_p,
+                .o = next_o,
+                .prev_face = face,
+                .next_move = 0,
+                .min_excess = INT_MAX,
+            };
+
+            descended = 1;
+            break;
+        }
+
+        /*
+         * We just pushed a child. Continue DFS from it.
+         */
+        if (descended)
+            continue;
+
+        /*
+         * No moves remain in this frame:
+         * equivalent to returning from recursive bm_dfs().
+         */
+        int result =
+            frame->min_excess;
+
+        /*
+         * Returning from root means this entire IDA*
+         * iteration has finished.
+         */
+        if (depth == 0)
+            return result;
+
+        --depth;
+
+        /*
+         * Propagate the minimum exceeded f-value to parent.
+         */
+        if (result < stack[depth].min_excess)
+            stack[depth].min_excess = result;
+    }
+}
+
+static bm_stats_t bm_solve_iterative_transition_design(
+    uint16_t p,
+    uint16_t o,
+    bm_transition_design_t design)
+{
+    bm_stats_t stats = {0};
+
+    stats.solution_depth = -1;
+
+    /*
+     * Initial IDA* threshold.
+     */
+    uint8_t hp = bm_perm_pdb[p];
+    uint8_t ho = bm_ori_pdb[o];
+
+    stats.pdb_table_loads += 2;
+
+    int bound =
+        hp > ho ? hp : ho;
+
+    for (;;) {
+        stats.expanded_iter = 0;
+        stats.generated_iter = 0;
+
+        int next =
+            bm_dfs_iterative_transition_design(
+                p,
+                o,
+                bound,
+                design,
+                &stats);
+
+        if (next == BM_FOUND)
+            return stats;
+
+        if (next == INT_MAX) {
+            fputs("iterative IDA* search failed\n",
+                  stderr);
+            exit(1);
+        }
+
+        bound = next;
+    }
+}
+
+static void bm_compare_stack_design(
+    const uint8_t *full_dist,
+    uint32_t d11_count)
+{
+    uint32_t count = 0;
+
+    uint64_t sum_expanded = 0;
+    uint64_t sum_generated = 0;
+
+    clock_t recursive_ticks = 0;
+    clock_t iterative_ticks = 0;
+
+    for (uint32_t rank = 0;
+         rank < STATES;
+         ++rank) {
+
+        if (full_dist[rank] != 11)
+            continue;
+
+        uint16_t p =
+            (uint16_t)
+            (rank / ORIENTATIONS);
+
+        uint16_t o =
+            (uint16_t)
+            (rank % ORIENTATIONS);
+
+        /*
+         * Use the selected Stage-3 candidate:
+         *
+         *   combined PDB
+         *   + 9-move transitions
+         */
+        clock_t begin =
+            clock();
+
+        bm_stats_t recursive =
+            bm_solve_transition_design(
+                p,
+                o,
+                BM_TRANS_9);
+
+        clock_t middle =
+            clock();
+
+        bm_stats_t iterative =
+            bm_solve_iterative_transition_design(
+                p,
+                o,
+                BM_TRANS_9);
+
+        clock_t end =
+            clock();
+
+        recursive_ticks +=
+            middle - begin;
+
+        iterative_ticks +=
+            end - middle;
+
+        /*
+         * The two implementations must produce identical
+         * search behavior.
+         */
+        if (recursive.solution_depth !=
+                iterative.solution_depth ||
+            recursive.expanded_total !=
+                iterative.expanded_total ||
+            recursive.generated_total !=
+                iterative.generated_total ||
+            recursive.transition_applications !=
+                iterative.transition_applications ||
+            recursive.transition_table_loads !=
+                iterative.transition_table_loads ||
+            recursive.pdb_table_loads !=
+                iterative.pdb_table_loads) {
+
+            char state_string[15];
+
+            bm_rank_to_string(
+                rank,
+                state_string);
+
+            fprintf(stderr,
+                    "\nstack mismatch on %s\n"
+                    "recursive:"
+                    " depth=%d"
+                    " expanded=%" PRIu64
+                    " generated=%" PRIu64
+                    " transitions=%" PRIu64
+                    " loads=%" PRIu64
+                    " pdb=%" PRIu64 "\n"
+                    "iterative:"
+                    " depth=%d"
+                    " expanded=%" PRIu64
+                    " generated=%" PRIu64
+                    " transitions=%" PRIu64
+                    " loads=%" PRIu64
+                    " pdb=%" PRIu64 "\n",
+                    state_string,
+
+                    recursive.solution_depth,
+                    recursive.expanded_total,
+                    recursive.generated_total,
+                    recursive.transition_applications,
+                    recursive.transition_table_loads,
+                    recursive.pdb_table_loads,
+
+                    iterative.solution_depth,
+                    iterative.expanded_total,
+                    iterative.generated_total,
+                    iterative.transition_applications,
+                    iterative.transition_table_loads,
+                    iterative.pdb_table_loads);
+
+            exit(1);
+        }
+
+        if (iterative.solution_depth != 11) {
+            fprintf(stderr,
+                    "unexpected solution depth %d\n",
+                    iterative.solution_depth);
+            exit(1);
+        }
+
+        sum_expanded +=
+            iterative.expanded_total;
+
+        sum_generated +=
+            iterative.generated_total;
+
+        ++count;
+
+        if (count % 100 == 0) {
+            fprintf(stderr,
+                    "\rtested %u / %u",
+                    count,
+                    d11_count);
+
+            fflush(stderr);
+        }
+    }
+
+    fprintf(stderr, "\n");
+
+    if (count != d11_count) {
+        fprintf(stderr,
+                "distance-11 count mismatch:"
+                " %u != %u\n",
+                count,
+                d11_count);
+
+        exit(1);
+    }
+
+    double recursive_seconds =
+        (double) recursive_ticks /
+        CLOCKS_PER_SEC;
+
+    double iterative_seconds =
+        (double) iterative_ticks /
+        CLOCKS_PER_SEC;
+
+    printf("\n"
+           "===== recursive vs explicit stack =====\n");
+
+    printf("distance-11 states = %u\n",
+           count);
+
+    printf("average expanded = %.2f\n",
+           (double) sum_expanded / count);
+
+    printf("average generated = %.2f\n",
+           (double) sum_generated / count);
+
+    printf("recursive CPU time = %.3f s\n",
+           recursive_seconds);
+
+    printf("explicit-stack CPU time = %.3f s\n",
+           iterative_seconds);
+
+    printf("all search counters match = yes\n");
 }
 
 static const char *bm_transition_design_name(
@@ -1076,6 +1505,32 @@ int main(int argc, char **argv)
 
     printf("permutation PDB max distance = %u\n",
            permutation_diameter);
+    
+    if (argc == 2
+        && !strcmp(argv[1], "--compare-stack")) {
+    
+        uint8_t full_diameter;
+        uint32_t d11_count;
+    
+        uint8_t *full_dist =
+            bm_build_full_distance(
+                &full_diameter,
+                &d11_count);
+    
+        printf("full-state diameter = %u\n",
+               full_diameter);
+    
+        printf("distance-11 states = %u\n",
+               d11_count);
+    
+        bm_compare_stack_design(
+            full_dist,
+            d11_count);
+    
+        free(full_dist);
+    
+        return 0;
+    }
 
 
     /*
